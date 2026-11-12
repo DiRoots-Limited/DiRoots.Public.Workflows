@@ -42,7 +42,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_https_url_with_project_path(self):
         self.assertEqual(publisher.site_url('https://example.test/product/'), 'https://example.test/product')
-        for value in ('http://example.test', 'https://user:pass@example.test', 'https://example.test/?q=x'):
+        for value in ('http://example.test', 'https://user:pass@example.test', 'https://:example-password@example.test',
+                      'https://@example.test', 'https://:@example.test', 'https://example.test/?q=x',
+                      'https://:443', 'https://example.test/a b', 'https://example.test/\npath'):
             with self.assertRaises(ValueError):
                 publisher.site_url(value)
 
@@ -165,6 +167,21 @@ class MutationTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_build_rejects_user_info_and_keeps_configurable_project_path(self):
+        build = yaml.safe_load((ROOT / '.github/workflows/docs-preview-build.yml').read_text())
+        code = next(s['run'] for s in build['jobs']['build']['steps'] if s.get('id') == 'configure')
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / 'outputs'
+            env = {'PREVIEW_DIR': 'review-sites', 'OUTPUT_DIR': 'html-output', 'PR_NUMBER': '7', 'GITHUB_OUTPUT': str(output)}
+            for url in ('https://user:pass@example.test', 'https://:example-password@example.test',
+                        'https://@example.test', 'https://:@example.test', 'https://:443', 'https://example.test/a b'):
+                with self.subTest(url=url), patch.dict(os.environ, {**env, 'SITE_URL': url}), self.assertRaises(ValueError):
+                    exec(compile(code, 'build-configure', 'exec'), {})
+            self.assertFalse(output.exists())
+            with patch.dict(os.environ, {**env, 'SITE_URL': 'https://another.example.test/custom-project/'}):
+                exec(compile(code, 'build-configure', 'exec'), {})
+            self.assertEqual(output.read_text(), 'baseurl=/custom-project/review-sites/pr-7\n')
+
     def test_embedded_python_compiles(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
             workflow = yaml.safe_load(path.read_text())

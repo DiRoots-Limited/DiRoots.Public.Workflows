@@ -154,10 +154,9 @@ jobs:
 
           def site_url(value):
               parsed = urlsplit(value)
-              if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
+              if (parsed.scheme != 'https' or not parsed.hostname or parsed.query or parsed.fragment or
+                  parsed.username is not None or parsed.password is not None or any(c.isspace() for c in value)):
                   raise ValueError('Expected an HTTPS site URL without credentials, query or fragment')
-              if any(char in value for char in '\r\n'):
-                  raise ValueError('Invalid site URL')
               return value.rstrip('/')
 
           def number(value):

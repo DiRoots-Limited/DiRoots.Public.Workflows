@@ -101,7 +101,9 @@ python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-Tests load the exact Python embedded in the reusable publisher, so there is no separate test-only implementation. They cover archive validation, paths, PR eligibility, idempotent cleanup, reopen handling, and state revalidation after a push conflict. All external actions are pinned by full SHA.
+PyYAML is the only development dependency. It parses the workflow YAML so tests can compile and execute the exact embedded Python and inspect workflow permissions and pinned action references. Python does not include a YAML parser in its standard library, and this repository had no existing parser to reuse. Using a YAML parser avoids brittle line-based extraction. The version is pinned in `requirements-dev.txt`; it is installed only by the validation workflow and local test command, not by the reusable build or publisher. This is the intended test-only parsing approach.
+
+Tests load the exact Python embedded in both reusable workflows, so there is no separate test-only implementation. They cover archive validation, paths, PR eligibility, idempotent cleanup, reopen handling, and state revalidation after a push conflict. All external actions are pinned by full SHA.
 
 GitHub's documented `concurrency.queue` option is newer than actionlint 1.7.12's schema. That version flags the `queue` key; do not remove the queue to silence it, as the default queue can discard pending operations. Validate the remaining syntax with that known schema limitation and confirm GitHub acceptance in the sandbox. See [GitHub concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 

@@ -1,0 +1,28 @@
+name: Docs preview publish
+
+on:
+  workflow_run:
+    workflows: [Docs preview build]
+    types: [completed]
+  pull_request_target:
+    branches: [gh-pages]
+    types: [closed]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    uses: DiRoots-Limited/DiRoots.Public.Workflows/.github/workflows/docs-preview-publish.yml@REVIEWED_COMMIT_SHA
+    with:
+      site-url: ${{ vars.DOCS_SITE_URL }}
+      app-id: ${{ vars.DOCS_PREVIEW_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.DOCS_PREVIEW_APP_PRIVATE_KEY }}

@@ -1,0 +1,101 @@
+name: Reusable documentation preview build
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        description: Production site URL, including any project path.
+        required: true
+        type: string
+      preview-dir:
+        type: string
+        default: previews
+      output-dir:
+        type: string
+        default: _site
+      ruby-version:
+        type: string
+        default: '3.3'
+      build-command:
+        description: Optional shell command using PREVIEW_BASEURL and OUTPUT_DIR.
+        type: string
+        default: ''
+      artifact-name:
+        type: string
+        default: docs-preview-site
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: docs-preview-build-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Configure preview build
+        id: configure
+        shell: python
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          PREVIEW_DIR: ${{ inputs.preview-dir }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          import os, re
+          from pathlib import PurePosixPath
+          from urllib.parse import urlsplit
+          site = urlsplit(os.environ['SITE_URL'])
+          if site.scheme != 'https' or not site.netloc or site.query or site.fragment or site.username:
+              raise ValueError('site-url must be an HTTPS site URL without credentials, query or fragment')
+          preview = os.environ['PREVIEW_DIR']
+          if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9._-]*', preview):
+              raise ValueError('preview-dir must be one non-hidden directory name')
+          output = PurePosixPath(os.environ['OUTPUT_DIR'])
+          if output.is_absolute() or '..' in output.parts or not output.parts or '\\' in str(output):
+              raise ValueError('output-dir must be a relative directory below the checkout')
+          if not os.environ['PR_NUMBER'].isdigit():
+              raise ValueError('Invalid PR number')
+          base = f"{site.path.rstrip('/')}/{preview}/pr-{os.environ['PR_NUMBER']}"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'baseurl={base}\n')
+          # Merge existing exclusions rather than replacing them; this override is build-only.
+          # Ruby parses the caller's Jekyll YAML after dependencies have been installed.
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1
+        with:
+          ruby-version: ${{ inputs.ruby-version }}
+          bundler-cache: true
+      - name: Build static preview
+        shell: bash
+        env:
+          PREVIEW_BASEURL: ${{ steps.configure.outputs.baseurl }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+          PREVIEW_DIR: ${{ inputs.preview-dir }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          override="$RUNNER_TEMP/docs-preview-config.yml"
+          export PREVIEW_CONFIG="$override"
+          ruby -ryaml -e '
+            config = YAML.load_file("_config.yml") || {}
+            excluded = Array(config["exclude"]) + [ENV.fetch("PREVIEW_DIR"), ENV.fetch("OUTPUT_DIR"), "vendor", "Gemfile", "Gemfile.lock"]
+            File.write(ENV.fetch("PREVIEW_CONFIG"), {"exclude" => excluded.uniq, "baseurl" => ENV.fetch("PREVIEW_BASEURL")}.to_yaml)
+          '
+          if [[ -n "$BUILD_COMMAND" ]]; then
+            bash -euo pipefail -c "$BUILD_COMMAND"
+          else
+            bundle exec jekyll build --config "_config.yml,$override" --destination "$OUTPUT_DIR" --baseurl "$PREVIEW_BASEURL"
+          fi
+          test -f "$OUTPUT_DIR/index.html"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.artifact-name }}-${{ github.run_attempt }}
+          path: ${{ inputs.output-dir }}/
+          if-no-files-found: error
+          retention-days: 1

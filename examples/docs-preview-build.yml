@@ -1,0 +1,16 @@
+name: Docs preview build
+
+on:
+  pull_request:
+    branches: [gh-pages]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: DiRoots-Limited/DiRoots.Public.Workflows/.github/workflows/docs-preview-build.yml@REVIEWED_COMMIT_SHA
+    with:
+      site-url: ${{ vars.DOCS_SITE_URL }}
+    # No secrets mapping and never secrets: inherit.

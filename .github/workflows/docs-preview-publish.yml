@@ -1,0 +1,394 @@
+name: Reusable documentation preview publisher
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        type: string
+        required: true
+      app-id:
+        type: string
+        required: true
+      pages-branch:
+        type: string
+        default: gh-pages
+      preview-dir:
+        type: string
+        default: previews
+      build-workflow:
+        description: Filename of the caller build workflow to trust.
+        type: string
+        default: docs-preview-build.yml
+      artifact-name:
+        type: string
+        default: docs-preview-site
+      comment-marker:
+        type: string
+        default: docs-preview
+      max-preview-mib:
+        type: number
+        default: 100
+      max-source-mib:
+        description: Maximum Pages branch file total after mutation; not a built-site measurement.
+        type: number
+        default: 800
+      wait-seconds:
+        type: number
+        default: 600
+    secrets:
+      app-private-key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'pull_request_target' && github.event.action == 'closed') ||
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    concurrency:
+      group: docs-preview-mutate-${{ inputs.pages-branch }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Resolve trusted event
+        id: resolve
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PAGES_BRANCH: ${{ inputs.pages-branch }}
+          BUILD_WORKFLOW: ${{ inputs.build-workflow }}
+        with:
+          script: |
+            const self = `${context.repo.owner}/${context.repo.repo}`;
+            const base = process.env.PAGES_BRANCH;
+            core.setOutput('eligible', 'false');
+            if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(base) || base.includes('..')) {
+              throw new Error('Invalid pages branch');
+            }
+            if (context.eventName === 'workflow_run') {
+              const {data: run} = await github.rest.actions.getWorkflowRun({...context.repo, run_id: context.payload.workflow_run.id});
+              const {data: workflow} = await github.rest.actions.getWorkflow({...context.repo, workflow_id: process.env.BUILD_WORKFLOW});
+              if (run.workflow_id !== workflow.id || run.event !== 'pull_request' || run.conclusion !== 'success' ||
+                  run.repository.full_name !== self || run.head_repository?.full_name !== self) return;
+              const prs = await github.paginate(github.rest.pulls.list, {...context.repo, state: 'open', base,
+                head: `${context.repo.owner}:${run.head_branch}`, per_page: 100});
+              const pr = prs.find(p => p.head.repo?.full_name === self && p.head.sha === run.head_sha && p.base.ref === base);
+              if (!pr) return;
+              core.setOutput('number', String(pr.number));
+              core.setOutput('sha', run.head_sha);
+              core.setOutput('run', String(run.id));
+              core.setOutput('attempt', String(run.run_attempt));
+            } else if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (pr.base.ref !== base || pr.head.repo?.full_name !== self) return;
+              core.setOutput('number', String(pr.number));
+            }
+            core.setOutput('eligible', 'true');
+      - name: Create repository-scoped publisher token
+        if: steps.resolve.outputs.eligible == 'true'
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - name: Check out only the publishing branch
+        if: steps.resolve.outputs.eligible == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.pages-branch }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: pages
+      - name: Publish or reconcile static previews
+        if: steps.resolve.outputs.eligible == 'true'
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          SITE_URL: ${{ inputs.site-url }}
+          PAGES_BRANCH: ${{ inputs.pages-branch }}
+          PREVIEW_DIR: ${{ inputs.preview-dir }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          COMMENT_MARKER: ${{ inputs.comment-marker }}
+          MAX_PREVIEW_MIB: ${{ inputs.max-preview-mib }}
+          MAX_SOURCE_MIB: ${{ inputs.max-source-mib }}
+          WAIT_SECONDS: ${{ inputs.wait-seconds }}
+          PR_NUMBER: ${{ steps.resolve.outputs.number }}
+          PREVIEW_SHA: ${{ steps.resolve.outputs.sha }}
+          BUILD_RUN: ${{ steps.resolve.outputs.run }}
+          BUILD_ATTEMPT: ${{ steps.resolve.outputs.attempt }}
+        run: |
+          import base64
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import tempfile
+          import time
+          import zipfile
+          from pathlib import Path, PurePosixPath
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote, urlsplit
+          from urllib.request import Request, urlopen
+
+          def component(value):
+              if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9._-]*', value):
+                  raise ValueError('Expected a non-hidden path component')
+              return value
+
+          def site_url(value):
+              parsed = urlsplit(value)
+              if (parsed.scheme != 'https' or not parsed.hostname or parsed.query or parsed.fragment or
+                  parsed.username is not None or parsed.password is not None or any(c.isspace() for c in value)):
+                  raise ValueError('Expected an HTTPS site URL without credentials, query or fragment')
+              return value.rstrip('/')
+
+          def number(value):
+              if not re.fullmatch(r'[1-9][0-9]*', str(value)):
+                  raise ValueError('Expected a positive PR number')
+              return int(value)
+
+          def safe_target(root, relative):
+              target = root / relative
+              if target.is_symlink() or any(p.is_symlink() for p in target.parents if p != root.parent):
+                  raise ValueError('Symlink in destination path')
+              if not target.resolve().is_relative_to(root.resolve()):
+                  raise ValueError('Destination escapes checkout')
+              return target
+
+          def extract_site(data, destination, limit):
+              total, seen = 0, set()
+              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                  entries = archive.infolist()
+                  if len(entries) > 20000:
+                      raise ValueError('Too many artifact entries')
+                  for entry in entries:
+                      raw = entry.orig_filename
+                      path = PurePosixPath(raw)
+                      mode = entry.external_attr >> 16
+                      if (not path.parts or path.is_absolute() or '\\' in raw or ':' in raw or any(ord(c) < 32 for c in raw) or
+                          any(p in ('.', '..') or p.startswith('.') for p in raw.rstrip('/').split('/')) or
+                          stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                          raise ValueError('Unsafe artifact path or file type')
+                      key = str(path).casefold()
+                      if key in seen:
+                          raise ValueError('Duplicate artifact path')
+                      seen.add(key)
+                      total += entry.file_size
+                      if total > limit:
+                          raise ValueError('Preview exceeds expanded size budget')
+                  # Validate the whole archive before creating anything.
+                  for entry in entries:
+                      target = destination / entry.filename
+                      if entry.is_dir():
+                          target.mkdir(parents=True, exist_ok=True)
+                      else:
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          with archive.open(entry) as source, target.open('xb') as output:
+                              shutil.copyfileobj(source, output)
+              if not (destination / 'index.html').is_file():
+                  raise ValueError('Artifact has no index.html')
+              (destination / 'CNAME').unlink(missing_ok=True)
+              for page in destination.rglob('*.html'):
+                  html = page.read_text(encoding='utf-8')
+                  html = re.sub(r'<head\b[^>]*>', lambda m: m[0] + '<meta name="robots" content="noindex">', html, count=1, flags=re.I)
+                  page.write_text(html, encoding='utf-8')
+
+          class Client:
+              def __init__(self):
+                  self.repo = os.environ['GITHUB_REPOSITORY']
+                  self.api = os.environ['GITHUB_API_URL'].rstrip('/')
+
+              def request(self, path, method='GET', payload=None):
+                  request = Request(self.api + '/repos/' + self.repo + '/' + path, method=method,
+                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                               'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+                               'X-GitHub-Api-Version': '2022-11-28'},
+                      data=None if payload is None else json.dumps(payload).encode())
+                  with urlopen(request, timeout=30) as response:
+                      return json.load(response)
+
+              def items(self, path, key=None):
+                  page = 1
+                  while True:
+                      data = self.request(path + ('&' if '?' in path else '?') + f'per_page=100&page={page}')
+                      values = data[key] if key else data
+                      yield from values
+                      if len(values) < 100:
+                          break
+                      page += 1
+
+              def pr(self, n):
+                  return self.request(f'pulls/{number(n)}')
+
+          def eligible(pr, repo, branch, sha):
+              return (pr['state'] == 'open' and pr['base']['ref'] == branch and
+                      (pr['head'].get('repo') or {}).get('full_name') == repo and pr['head']['sha'] == sha)
+
+          def comment(client, n, body, create=True):
+              marker = '<!-- ' + component(os.environ['COMMENT_MARKER']) + ' -->'
+              comments = client.items(f'issues/{number(n)}/comments')
+              existing = next((c for c in comments if c['user']['login'] == 'github-actions[bot]' and marker in (c.get('body') or '')), None)
+              payload = {'body': body + '\n\n' + marker}
+              if existing:
+                  client.request(f"issues/comments/{existing['id']}", 'PATCH', payload)
+              elif create:
+                  client.request(f'issues/{number(n)}/comments', 'POST', payload)
+
+          def git(root, *args, check=True, auth=False):
+              env = os.environ.copy()
+              if auth:
+                  token = base64.b64encode(('x-access-token:' + os.environ['APP_TOKEN']).encode()).decode()
+                  env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.extraHeader', GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + token)
+              # Never echo subprocess arguments or credentials on failure.
+              result = subprocess.run(['git', '-C', str(root), *args], env=env, capture_output=True, text=True)
+              if check and result.returncode:
+                  raise RuntimeError('Git operation failed: ' + args[0])
+              return result
+
+          def mutate(client, root, n, prepared, sha, budget):
+              relative = component(os.environ['PREVIEW_DIR']) + '/pr-' + str(number(n))
+              branch = os.environ['PAGES_BRANCH']
+              for attempt in range(5):
+                  git(root, 'fetch', '--depth=1', 'origin', branch, auth=True)
+                  git(root, 'reset', '--hard', 'FETCH_HEAD')
+                  pr = client.pr(n)
+                  if prepared is not None:
+                      if not eligible(pr, client.repo, branch, sha):
+                          return False
+                  elif pr['state'] != 'closed':
+                      return False
+                  target = safe_target(root, relative)
+                  if prepared is None and not target.exists():
+                      return True
+                  if target.exists():
+                      if not target.is_dir():
+                          raise ValueError('Preview target is not a directory')
+                      shutil.rmtree(target)
+                  if prepared is not None:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copytree(prepared, target)
+                      size = sum(p.stat().st_size for p in root.rglob('*') if p.is_file() and '.git' not in p.relative_to(root).parts)
+                      if size > budget:
+                          raise ValueError('Pages source exceeds configured budget; deployment unchanged')
+                  git(root, 'add', '-A', '--', relative)
+                  if git(root, 'diff', '--cached', '--quiet', check=False).returncode == 0:
+                      return True
+                  action = 'publish' if prepared is not None else 'remove'
+                  git(root, 'commit', '-m', f'docs: {action} preview for PR {n}')
+                  if git(root, 'push', 'origin', 'HEAD:refs/heads/' + branch, auth=True, check=False).returncode == 0:
+                      return True
+                  time.sleep(2 ** attempt)
+              raise RuntimeError('Could not push preview change after five attempts')
+
+          def wait_for_site(url, expected, timeout):
+              deadline = time.monotonic() + timeout
+              while time.monotonic() < deadline:
+                  try:
+                      with urlopen(Request(url + '?check=' + str(time.time_ns()), headers={'Cache-Control': 'no-cache'}), timeout=15) as response:
+                          body = response.read(65536)
+                      if expected is not None and json.loads(body) == expected:
+                          return
+                  except HTTPError as error:
+                      if expected is None and error.code == 404:
+                          return
+                  except (URLError, TimeoutError, ValueError):
+                      pass
+                  time.sleep(10)
+              raise RuntimeError('Pages did not serve the expected preview state before timeout')
+
+          def main():
+              client = Client()
+              site = site_url(os.environ['SITE_URL'])
+              preview = component(os.environ['PREVIEW_DIR'])
+              component(os.environ['COMMENT_MARKER'])
+              limit = int(os.environ['MAX_PREVIEW_MIB']) * 1024 * 1024
+              budget = int(os.environ['MAX_SOURCE_MIB']) * 1024 * 1024
+              timeout = int(os.environ['WAIT_SECONDS'])
+              if not 0 < limit <= budget or not 0 < timeout <= 900:
+                  raise ValueError('Invalid size budget or wait timeout')
+              root = Path('pages').resolve()
+              slug = os.environ['APP_SLUG']
+              git(root, 'config', 'user.name', slug + '[bot]')
+              git(root, 'config', 'user.email', slug + '[bot]@users.noreply.github.com')
+              n = os.environ.get('PR_NUMBER')
+              if os.environ['GITHUB_EVENT_NAME'] == 'workflow_run':
+                  n = number(n)
+                  sha = os.environ['PREVIEW_SHA']
+                  if not re.fullmatch(r'[0-9a-f]{40}', sha):
+                      raise ValueError('Invalid head SHA')
+                  if not eligible(client.pr(n), client.repo, os.environ['PAGES_BRANCH'], sha):
+                      print('Skipped stale or closed PR')
+                      return
+                  run = number(os.environ['BUILD_RUN'])
+                  attempt = number(os.environ['BUILD_ATTEMPT'])
+                  current = client.request(f'actions/runs/{run}')
+                  if current['run_attempt'] != attempt or current['conclusion'] != 'success':
+                      print('Skipped superseded run attempt')
+                      return
+                  name = os.environ['ARTIFACT_NAME'] + '-' + str(attempt)
+                  artifacts = [a for a in client.items(f'actions/runs/{run}/artifacts', 'artifacts') if a['name'] == name and not a['expired']]
+                  if len(artifacts) != 1 or artifacts[0]['size_in_bytes'] > limit:
+                      raise ValueError('Expected exactly one non-expired artifact within size budget')
+                  # gh follows the signed artifact redirect without forwarding the API token to blob storage.
+                  result = subprocess.run(['gh', 'api', f"repos/{client.repo}/actions/artifacts/{artifacts[0]['id']}/zip"], capture_output=True)
+                  if result.returncode or len(result.stdout) > limit:
+                      raise RuntimeError('Could not download bounded preview artifact')
+                  identity = {'pull_request': n, 'head_sha': sha, 'run_id': run, 'run_attempt': attempt}
+                  with tempfile.TemporaryDirectory() as temp:
+                      prepared = Path(temp)
+                      extract_site(result.stdout, prepared, limit)
+                      (prepared / 'preview-info.json').write_text(json.dumps(identity), encoding='utf-8')
+                      if not mutate(client, root, n, prepared, sha, budget):
+                          print('Skipped PR changed during publish')
+                          return
+                  url = f'{site}/{preview}/pr-{n}/'
+                  wait_for_site(url + 'preview-info.json', identity, timeout)
+                  pr = client.pr(n)
+                  if eligible(pr, client.repo, os.environ['PAGES_BRANCH'], sha):
+                      comment(client, n, f'Documentation preview: [open preview]({url})\n\nBuilt from commit `{sha}`.')
+                      return
+                  if pr['state'] == 'open':
+                      print('PR updated while Pages deployed; next build will update the preview')
+                      return
+                  # Repair a close that arrived between the last API check and the push.
+              candidates = [number(n)] if n else []
+              if not n:
+                  directory = safe_target(root, preview)
+                  if directory.exists():
+                      candidates = [number(p.name[3:]) for p in directory.iterdir() if re.fullmatch(r'pr-[1-9][0-9]*', p.name)]
+                  # Also repair comments if deletion succeeded but a previous comment update failed.
+                  for pr in client.items('pulls?state=closed&base=' + quote(os.environ['PAGES_BRANCH'], safe='')):
+                      marker = '<!-- ' + component(os.environ['COMMENT_MARKER']) + ' -->'
+                      comments = client.items(f"issues/{pr['number']}/comments")
+                      if any(c['user']['login'] == 'github-actions[bot]' and marker in (c.get('body') or '') and
+                             'Preview removed because' not in c['body'] for c in comments):
+                          candidates.append(number(pr['number']))
+                  candidates = sorted(set(candidates))
+              for closed in candidates:
+                  if client.pr(closed)['state'] != 'closed':
+                      continue
+                  if mutate(client, root, closed, None, None, budget):
+                      wait_for_site(f'{site}/{preview}/pr-{closed}/preview-info.json', None, timeout)
+                      if client.pr(closed)['state'] == 'closed':
+                          comment(client, closed, f'Preview removed because PR {closed} is closed.', create=False)
+              print('Preview operation completed')
+
+          if __name__ == '__main__':
+              main()

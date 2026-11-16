@@ -221,7 +221,9 @@ class MediaReuseTests(unittest.TestCase):
             '<a href="https://other.example/proj/previews/pr-7/assets/images/same.gif">other host</a>',
             '<img srcset="data:image/svg+xml;base64,AA,BB 1x, ../assets/images/same.gif 2x">',
             '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
-            '<img src="../assets/images/same.gif&#63;x">',
+            '<img src=../assets/images/same.gif alt=unquoted>',
+            '<img srcset=../assets/images/same.gif>',
+            '<p>notsame.gif is a different file name.</p>',
         ]))
         self.write(site, 'assets/css/site.css',
                    '.a{background:url("../images/same.gif")} .b{background:url(/proj/previews/pr-7/assets/images/same.gif)}')
@@ -231,11 +233,12 @@ class MediaReuseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = self.repository(temp)
             with contextlib.chdir(root):
-                reused, references = reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj',
-                                                  reuser.base_blobs())
+                reused, references, kept = reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj',
+                                                        reuser.base_blobs())
             site = root / '_site'
             self.assertEqual(set(reused), {'assets/images/same.gif'})
-            self.assertEqual(references, 12)
+            self.assertEqual(references, 14)
+            self.assertEqual(kept, [])
             self.assertFalse((site / 'assets/images/same.gif').exists())
             self.assertFalse((site / 'assets/images').exists(), 'empty directories are removed')
             self.assertEqual((site / 'docs/images/changed.png').read_bytes(), self.NEW)
@@ -261,13 +264,33 @@ class MediaReuseTests(unittest.TestCase):
                 # srcset follows HTML parsing: the comma inside the data URI is not a separator.
                 '<img srcset="data:image/svg+xml;base64,AA,BB 1x, /proj/assets/images/same.gif 2x">',
                 '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
-                # An entity-encoded query marker cannot be preserved exactly, so the URL is left alone.
-                '<img src="../assets/images/same.gif&#63;x">',
+                # Unquoted attribute values are valid HTML and are rewritten too.
+                '<img src=/proj/assets/images/same.gif alt=unquoted>',
+                '<img srcset=/proj/assets/images/same.gif>',
+                '<p>notsame.gif is a different file name.</p>',
             ])
             self.assertEqual((site / 'index.html').read_text(),
                              '<img src="/proj/assets/images/same.gif"><img src="docs/images/new.gif">')
             self.assertEqual((site / 'assets/css/site.css').read_text(),
                              '.a{background:url("/proj/assets/images/same.gif")} .b{background:url(/proj/assets/images/same.gif)}')
+
+    def test_media_named_outside_rewritable_references_is_kept(self):
+        cases = {
+            'script': ('assets/js/app.js', 'const shot = "assets/images/same.gif";'),
+            'entity-encoded query': ('docs/other.html', '<img src="../assets/images/same.gif&#63;x">'),
+        }
+        for name, (relative, content) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temp:
+                root = self.repository(temp)
+                self.write(root / '_site', relative, content)
+                with contextlib.chdir(root):
+                    reused, references, kept = reuser.reuse(
+                        Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj', reuser.base_blobs())
+                self.assertEqual(reused, {})
+                self.assertEqual(kept, ['assets/images/same.gif'])
+                # The file stays, so both the rewritten live URLs and the unparsed mention still work.
+                self.assertEqual((root / '_site/assets/images/same.gif').read_bytes(), self.SAME)
+                self.assertEqual((root / '_site' / relative).read_text(), content)
 
     def test_site_at_domain_root_uses_root_paths(self):
         with tempfile.TemporaryDirectory() as temp:

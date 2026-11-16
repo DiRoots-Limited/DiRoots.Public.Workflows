@@ -22,7 +22,7 @@ The publisher is self-contained. It does not download executable helper code or 
 1. Configure GitHub Pages to deploy the documentation branch, normally `gh-pages`, from its root. Keep its existing deployment mode and production domain.
 2. Commit a tested `Gemfile` and `Gemfile.lock` to the documentation branch. DiStem uses `github-pages` 232 and `webrick`; choose and lock compatible dependencies for your site. The default build uses Ruby 3.3. A remote theme reference is separate from the gem lockfile.
 3. Install the publishing GitHub App on the selected caller repository. It needs Contents write and Metadata read. If the documentation branch is protected, allow the App's required writes through all applicable protection controls.
-4. Set Actions variable `DOCS_SITE_URL` to the full site URL, including a project path when applicable. Set `DOCS_PREVIEW_APP_ID` and secret `DOCS_PREVIEW_APP_PRIVATE_KEY` at repository or organization level. Restrict organization access to selected repositories.
+4. Write the public site URL, including a project path when applicable, as `site-url` in both callers. Do not read it from a repository variable: GitHub does not pass variables to pull requests from forks, and the URL is public anyway. Set `DOCS_PREVIEW_APP_ID` and secret `DOCS_PREVIEW_APP_PRIVATE_KEY` at organization level, restricted to selected repositories, or at repository level.
 5. Allow these reusable workflows and their pinned third-party actions under the caller's Actions policy.
 
 No credential values belong in this repository or caller YAML. The reusable publisher accepts credentials explicitly; it never assumes a particular App, owner, product repository or domain.
@@ -47,6 +47,9 @@ Merge the trusted publisher caller first, then the build caller, then open a fre
 | `ruby-version` | `3.3` | Version supported by the caller's locked dependencies. |
 | `build-command` | Empty | Optional Bash command executed only in the unprivileged build. |
 | `artifact-name` | `docs-preview-site` | Artifact prefix, shared with the publisher. |
+| `reuse-live-media` | `true` | Drop media the PR did not change and load it from the live site. See [Media reuse](#media-reuse). |
+
+The build runs only for same-repository PRs. Fork PRs show the build as skipped, because the publisher would never publish them; the publisher still rejects fork runs independently.
 
 The default command builds with the computed `PREVIEW_BASEURL`, `OUTPUT_DIR` and a temporary configuration that excludes existing previews, installed gems and build output. Existing Jekyll exclusions are retained. This configuration is never committed to production. Custom commands receive these variables and `PREVIEW_CONFIG`; they must apply that override, for example:
 
@@ -55,6 +58,14 @@ bundle exec jekyll build --config "_config.yml,$PREVIEW_CONFIG" --baseurl "$PREV
 ```
 
 Override a hard-coded production `url` in your custom build configuration if the theme generates absolute URLs. Internal links should respect Jekyll's `relative_url` filter. The actual checkout is the PR merge commit; the trusted publisher identifies its associated current PR head from GitHub's run and PR API data.
+
+### Media reuse
+
+Documentation sites are mostly images and GIFs, and a docs PR rarely changes them. Copying the whole built site into each preview would put hundreds of megabytes per open PR into the Pages branch, beyond the publisher's budgets for large manuals. After the Jekyll build, the build compares every media file (`gif`, `png`, `jpg`, `jpeg`, `webp`, `svg`, `avif`, `bmp`, `ico`, `mp4`, `webm`, `mov`) with the same path in the docs branch head that GitHub merged the PR into. A byte-identical file is already served by the live site, so the preview drops its copy and rewrites references in HTML and CSS to the live URL. HTML pages, and new or changed media, stay in the preview, so it remains a complete, navigable site.
+
+References are rewritten in `src`, `href`, `poster`, `data-src` and `srcset` attributes, quoted or unquoted, and in CSS `url()` values. Relative paths (including Windows-style `..\` separators), absolute paths under the preview base and absolute URLs on the docs site's own origin are resolved against each page's location; queries and fragments keep their original escaping. URLs on other hosts, `data:` URIs and paths that escape the site are left alone. Before deleting a file, the build checks that every mention of its name in HTML, CSS, JavaScript, JSON and XML output was a reference it rewrote or confirmed points elsewhere. Any other mention, such as an image path built in JavaScript, keeps that file in the preview, so a reference it cannot parse never breaks; the summary reports how many files were kept this way. The checkout fetches the merge commit's first parent for the comparison; if it is unavailable, the preview keeps every file. The build summary reports the preview size before and after reuse.
+
+While a PR is open, a reused image shows the live version. If someone changes that image on the docs branch meanwhile, the preview shows the new live image until the PR is updated.
 
 Artifacts are named `<artifact-name>-<run-attempt>` and retained for one day. The publisher selects the expected attempt from the triggering run, avoiding ambiguity after reruns.
 
@@ -75,11 +86,11 @@ Artifacts are named `<artifact-name>-<run-attempt>` and retained for one day. Th
 
 Pass secret `app-private-key` explicitly. The caller grants `contents: read`, `actions: read`, and `pull-requests: write`; the App token supplies Contents write for git pushes. Build callers grant only `contents: read` and pass no publishing secrets.
 
-The source-size budget is not a measurement of generated production output. Before onboarding a site, measure its built output plus retained previews against GitHub Pages' 1 GB published-site limit. Preview updates and cleanup also trigger legacy Pages deployments. Increase budgets only after checking capacity. Large sites may need a different hosting design.
+The source-size budget is not a measurement of generated production output. Before onboarding a site, measure its built output plus retained previews against GitHub Pages' 1 GB published-site limit. Preview updates and cleanup also trigger legacy Pages deployments. Increase budgets only after checking capacity. Media reuse keeps previews of large manuals small; check a large site's preview size in the build summary during onboarding.
 
 ### Publication and cleanup safeguards
 
-- Accept only successful `pull_request` runs from the expected workflow identity and calling repository, with a same-repository PR targeting the configured docs branch and a matching current head SHA. Fork runs are ignored.
+- Accept only successful `pull_request` runs from the expected workflow identity and calling repository, with a same-repository PR targeting the configured docs branch and a matching current head SHA. Fork runs are ignored, and the build skips fork PRs before building.
 - Download only the named artifact from the triggering run and current attempt. Reject ambiguous or expired artifacts.
 - Validate the entire archive before extracting: refuse traversal, hidden paths, duplicate paths, symlinks, unsupported file types, excessive entries and excessive expanded size. Require `index.html`, remove preview-local `CNAME`, and add `noindex` metadata to HTML head elements.
 - Write only the validated preview directory. Reject symlink ancestors and paths escaping the destination checkout. Never build or execute downloaded content in the publishing job.

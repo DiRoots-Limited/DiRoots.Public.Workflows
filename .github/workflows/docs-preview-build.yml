@@ -23,13 +23,22 @@ on:
       artifact-name:
         type: string
         default: docs-preview-site
+      reuse-live-media:
+        description: Drop media files the PR did not change and load them from the live site instead.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    # Fork PRs are never published, so skip their build instead of spending minutes
+    # on a preview the publisher would refuse. This is not a security boundary: the
+    # publisher independently rejects runs whose head repository is not the caller.
+    if: >-
+      github.event_name == 'pull_request' && github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     concurrency:
@@ -39,6 +48,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # The PR merge commit plus its first parent: the docs branch head GitHub merged into.
+          fetch-depth: 2
       - name: Configure preview build
         id: configure
         shell: python
@@ -94,6 +105,248 @@ jobs:
             bundle exec jekyll build --config "_config.yml,$override" --destination "$OUTPUT_DIR" --baseurl "$PREVIEW_BASEURL"
           fi
           test -f "$OUTPUT_DIR/index.html"
+      - name: Reuse unchanged media from the live site
+        id: reuse
+        if: inputs.reuse-live-media
+        shell: python
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          PREVIEW_BASEURL: ${{ steps.configure.outputs.baseurl }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+        run: |
+          # Docs sites are mostly images and GIFs, and a docs PR rarely changes them. Copying
+          # the whole built site into every preview makes large manuals exceed the Pages and
+          # artifact budgets. A media file whose bytes match the docs branch head is already
+          # served by the live site at the same path, so the preview drops its copy and its
+          # pages load that file from the live site. Pages, new media and changed media stay.
+          import collections
+          import hashlib
+          import html
+          import os
+          import posixpath
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import quote, unquote, urlsplit
+
+          MEDIA = {'.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.mov', '.mp4', '.png', '.svg', '.webm', '.webp'}
+          # Attribute values may be quoted or, in valid HTML, unquoted.
+          ATTRIBUTE = re.compile(r'''(\b(?:src|href|poster|data-src)\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))''', re.I | re.S)
+          SRCSET = re.compile(r'''(\bsrcset\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))''', re.I | re.S)
+          # Text files searched for other mentions of a reused file before it is deleted.
+          SCANNED = {'.css', '.htm', '.html', '.js', '.json', '.mjs', '.svg', '.webmanifest', '.xml'}
+          CSS_URL = re.compile(r'''(url\(\s*)(["']?)([^"')]*?)\2(\s*\))''', re.I)
+          SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
+
+          def base_blobs():
+              """Map each file path in the merge commit's first parent to its git blob id."""
+              listing = subprocess.run(['git', 'ls-tree', '-r', '-z', 'HEAD^1'], capture_output=True, check=True).stdout
+              blobs = {}
+              for record in listing.split(b'\0'):
+                  if record:
+                      meta, path = record.split(b'\t', 1)
+                      mode, kind, blob = meta.split(b' ')
+                      if kind == b'blob' and mode in (b'100644', b'100755'):
+                          blobs[path.decode('utf-8', 'surrogateescape')] = blob.decode()
+              return blobs
+
+          def blob_id(data):
+              """Return the git blob id (SHA-1) of the given bytes, matching `git hash-object`."""
+              return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
+
+          def unchanged_media(site, blobs):
+              """Map built media paths whose bytes equal the docs branch head to their size in bytes."""
+              found = {}
+              for path in site.rglob('*'):
+                  if path.suffix.lower() in MEDIA and path.is_file() and not path.is_symlink():
+                      relative = path.relative_to(site).as_posix()
+                      data = path.read_bytes()
+                      if blobs.get(relative) == blob_id(data):
+                          found[relative] = len(data)
+              return found
+
+          class Rewriter:
+              """Point references to reused media at the live site, leaving every other URL as written."""
+
+              def __init__(self, preview_base, site_url, reused):
+                  """Take the preview base path, the live site URL and the set of reused site-relative paths."""
+                  site = urlsplit(site_url)
+                  self.preview = preview_base.rstrip('/') + '/'
+                  self.live = site.path.rstrip('/')
+                  self.origin = (site.scheme.lower(), site.netloc.lower())
+                  self.reused = reused
+                  self.names = {posixpath.basename(path) for path in reused}
+                  self.accounted = collections.Counter()
+                  self.count = 0
+
+              def target(self, raw, page_dir):
+                  """Return (origin, site-relative path, decoded query/fragment) for a URL in this preview, else None."""
+                  value = html.unescape(raw).strip().replace('\\', '/')
+                  if not value or value.startswith(('#', '//')):
+                      return None
+                  parts = urlsplit(value)
+                  origin = ''
+                  if SCHEME.match(value):
+                      # Only absolute URLs on the docs site itself can point into the preview.
+                      if (parts.scheme.lower(), parts.netloc.lower()) != self.origin:
+                          return None
+                      origin = f'{parts.scheme}://{parts.netloc}'
+                  path = parts.path
+                  if path.startswith('/'):
+                      if not path.startswith(self.preview):
+                          return None
+                      path = path[len(self.preview):]
+                  elif origin:
+                      return None
+                  else:
+                      path = posixpath.join(page_dir, path)
+                  path = posixpath.normpath(unquote(path)).strip()
+                  if path in ('.', '..') or path.startswith(('../', '/')):
+                      return None
+                  marks = [i for i in (value.find('?'), value.find('#')) if i >= 0]
+                  return origin, path, value[min(marks):] if marks else ''
+
+              def note(self, written):
+                  """Record that a parsed URL naming a reused file is safe: rewritten, or not in the preview."""
+                  value = html.unescape(written).strip().replace('\\', '/')
+                  name = unquote(posixpath.basename(urlsplit(value).path)).strip()
+                  if name in self.names:
+                      self.accounted[name] += 1
+
+              def url(self, raw, page_dir):
+                  """Rewrite one URL as written in the document; return it unchanged unless it is reused media."""
+                  found = self.target(raw, page_dir)
+                  if not found or found[1] not in self.reused:
+                      self.note(raw)
+                      return raw
+                  origin, path, suffix = found
+                  # Keep the query and fragment exactly as written, so HTML or CSS escaping is preserved.
+                  # The written suffix must decode to the parsed one; this rejects a '#' inside an
+                  # entity such as '&#63;'. Such a URL is left as is, and the file is then kept.
+                  kept = ''
+                  if suffix:
+                      starts = [i for i, c in enumerate(raw) if c in '?#']
+                      kept = next((raw[i:] for i in starts
+                                   if html.unescape(raw[i:]).strip().replace('\\', '/') == suffix), None)
+                      if kept is None:
+                          return raw
+                  self.count += 1
+                  written = f'{origin}{self.live}/{quote(path)}{kept}'
+                  self.note(written)
+                  return written
+
+              def srcset(self, raw, page_dir):
+                  """Rewrite srcset candidates using HTML's parsing rules, so data URIs with commas stay intact."""
+                  candidates, index, changed = [], 0, False
+                  while index < len(raw):
+                      while index < len(raw) and (raw[index].isspace() or raw[index] == ','):
+                          index += 1
+                      if index >= len(raw):
+                          break
+                      start = index
+                      while index < len(raw) and not raw[index].isspace():
+                          index += 1
+                      address, descriptor = raw[start:index], ''
+                      if address.endswith(','):
+                          address = address.rstrip(',')
+                      else:
+                          start, depth = index, 0
+                          while index < len(raw) and (raw[index] != ',' or depth > 0):
+                              if raw[index] == '(':
+                                  depth += 1
+                              elif raw[index] == ')' and depth > 0:
+                                  depth -= 1
+                              index += 1
+                          descriptor = raw[start:index].strip()
+                      rewritten = self.url(address, page_dir)
+                      changed = changed or rewritten != address
+                      candidates.append(rewritten + (' ' + descriptor if descriptor else ''))
+                  return ', '.join(candidates) if changed else raw
+
+              def document(self, text, page_dir, markup):
+                  """Rewrite one HTML (markup=True) or CSS file's references, resolved from page_dir."""
+                  def attribute(match, rewrite):
+                      # Group 2 is the quote; unquoted values (valid HTML) are in group 4.
+                      if match[2]:
+                          return match[1] + match[2] + rewrite(match[3], page_dir) + match[2]
+                      return match[1] + rewrite(match[4], page_dir)
+                  if markup:
+                      text = ATTRIBUTE.sub(lambda m: attribute(m, self.url), text)
+                      text = SRCSET.sub(lambda m: attribute(m, self.srcset), text)
+                  return CSS_URL.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2] + m[4], text)
+
+          def mentions(texts, names):
+              """Count whole-name occurrences of each file name (plain or percent-encoded) across texts."""
+              forms = {form: name for name in names for form in (name, quote(name))}
+              found = collections.Counter()
+              if not forms:
+                  return found
+              alternatives = '|'.join(re.escape(form) for form in sorted(forms, key=len, reverse=True))
+              pattern = re.compile(r'(?<![\w.%-])(' + alternatives + r')(?![\w-])')
+              for text in texts:
+                  for match in pattern.finditer(text):
+                      found[forms[match[1]]] += 1
+              return found
+
+          def reuse(site, preview_base, site_url, blobs):
+              """Rewrite references in the built site, then delete reused media that is safe to drop.
+
+              A file is deleted only when every mention of its name in HTML, CSS, JavaScript, JSON or XML
+              was a URL this step rewrote or confirmed points elsewhere. Any other mention, such as an
+              image path built in JavaScript, keeps the file in the preview, so no reference can break.
+              Returns the deleted paths with their sizes, the number of rewritten references, and the
+              kept paths.
+              """
+              candidates = unchanged_media(site, blobs)
+              rewriter = Rewriter(preview_base, site_url, set(candidates))
+              texts = []
+              for path in sorted(site.rglob('*')):
+                  suffix = path.suffix.lower()
+                  if suffix in SCANNED and path.is_file() and not path.is_symlink():
+                      text = path.read_text(encoding='utf-8', errors='surrogateescape')
+                      if suffix in ('.html', '.htm', '.css'):
+                          relative = path.relative_to(site).as_posix()
+                          updated = rewriter.document(text, posixpath.dirname(relative), suffix != '.css')
+                          if updated != text:
+                              path.write_text(updated, encoding='utf-8', errors='surrogateescape')
+                          text = updated
+                      texts.append(text)
+              seen = mentions(texts, rewriter.names)
+              unsafe = {name for name in rewriter.names if seen[name] > rewriter.accounted[name]}
+              kept = sorted(path for path in candidates if posixpath.basename(path) in unsafe)
+              deleted = {path: size for path, size in candidates.items() if posixpath.basename(path) not in unsafe}
+              for relative in deleted:
+                  (site / relative).unlink()
+              for directory in sorted((p for p in site.rglob('*') if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+                  if not any(directory.iterdir()):
+                      directory.rmdir()
+              return deleted, rewriter.count, kept
+
+          def main():
+              """Apply media reuse to OUTPUT_DIR and report the saving in the log and step summary."""
+              site = Path(os.environ['OUTPUT_DIR'])
+              try:
+                  blobs = base_blobs()
+              except (OSError, subprocess.CalledProcessError):
+                  print('::warning::Docs branch head is unavailable; the preview keeps every media file.')
+                  return
+              total = sum(p.stat().st_size for p in site.rglob('*') if p.is_file())
+              reused, references, kept = reuse(site, os.environ['PREVIEW_BASEURL'], os.environ['SITE_URL'], blobs)
+              saved = sum(reused.values())
+              mib = 1024 * 1024
+              summary = (f'Reused {len(reused)} unchanged media files from the live site and rewrote '
+                         f'{references} references. Preview size {(total - saved) / mib:.1f} MiB '
+                         f'instead of {total / mib:.1f} MiB.')
+              if kept:
+                  summary += (f' Kept {len(kept)} unchanged media files in the preview because their names '
+                              f'also appear outside rewritable references.')
+              print(summary)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+                      out.write(f'### Documentation preview build\n\n{summary}\n')
+
+          if __name__ == '__main__':
+              main()
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.artifact-name }}-${{ github.run_attempt }}

@@ -1,4 +1,5 @@
 """Test the exact Python embedded in the reusable publisher, without credentials."""
+import contextlib
 import io
 import json
 import os
@@ -18,6 +19,10 @@ WORKFLOW = yaml.safe_load((ROOT / '.github/workflows/docs-preview-publish.yml').
 CODE = next(s['run'] for s in WORKFLOW['jobs']['preview']['steps'] if s.get('name') == 'Publish or reconcile static previews')
 publisher = types.ModuleType('publisher')
 exec(compile(CODE, 'publisher-workflow', 'exec'), publisher.__dict__)
+BUILD = yaml.safe_load((ROOT / '.github/workflows/docs-preview-build.yml').read_text())
+REUSE_CODE = next(s['run'] for s in BUILD['jobs']['build']['steps'] if s.get('id') == 'reuse')
+reuser = types.ModuleType('reuser')
+exec(compile(REUSE_CODE, 'build-reuse', 'exec'), reuser.__dict__)
 
 
 def archive(files):
@@ -166,7 +171,164 @@ class MutationTests(unittest.TestCase):
         self.assertEqual(calls.count('fetch'), 2)
 
 
+class MediaReuseTests(unittest.TestCase):
+    """Run the exact build reuse step against a real git history and a built site."""
+    SAME, OLD, NEW = b'GIF89a\0same', b'PNG\0old', b'PNG\0new'
+
+    def git(self, root, *args):
+        return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True, text=True)
+
+    def write(self, root, relative, content):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content if isinstance(content, bytes) else content.encode())
+
+    def repository(self, temp, with_parent=True):
+        """Docs branch head with media, then a PR merge commit that changes one image and adds one."""
+        root = Path(temp)
+        self.git(root, 'init', '-q')
+        for key, value in (('core.autocrlf', 'false'), ('user.name', 'Test'), ('user.email', 'test@example.invalid')):
+            self.git(root, 'config', key, value)
+        self.write(root, 'assets/images/same.gif', self.SAME)
+        self.write(root, 'docs/images/changed.png', self.OLD)
+        self.write(root, 'docs/page.md', 'Page')
+        self.git(root, 'add', '.')
+        self.git(root, 'commit', '-q', '-m', 'Docs branch head')
+        if with_parent:
+            self.write(root, 'docs/images/changed.png', self.NEW)
+            self.write(root, 'docs/images/new.gif', b'GIF89a\0new')
+            self.git(root, 'add', '.')
+            self.git(root, 'commit', '-q', '-m', 'PR merge commit')
+        site = root / '_site'
+        self.write(site, 'assets/images/same.gif', self.SAME)
+        self.write(site, 'docs/images/changed.png', self.NEW)
+        self.write(site, 'docs/images/new.gif', b'GIF89a\0new')
+        self.write(site, 'index.html', '<img src="assets/images/same.gif"><img src="docs/images/new.gif">')
+        self.write(site, 'docs/page.html', '\n'.join([
+            '<img src="../assets/images/same.gif">',
+            '<img src="..\\assets\\images\\same.gif">',
+            '<img src="/proj/previews/pr-7/assets/images/same.gif?v=1#top">',
+            '<a href="https://docs.example.test/proj/previews/pr-7/assets/images/same.gif">full size</a>',
+            '<img srcset="../assets/images/same.gif 1x, images/new.gif 2x">',
+            '<img src="images/changed.png">',
+            '<img src="images/new.gif">',
+            '<img src="../../../etc/same.gif">',
+            '<img src="data:image/gif;base64,AAAA">',
+            '<a href="https://other.example/assets/images/same.gif">external</a>',
+            "<div style=\"background: url('../assets/images/same.gif')\"></div>",
+            '<img src="/proj/previews/pr-7/assets/images/same.gif%20">',
+            '<img src="../assets/images/same.gif?a=1&amp;b=&quot;x">',
+            '<a href="https://other.example/proj/previews/pr-7/assets/images/same.gif">other host</a>',
+            '<img srcset="data:image/svg+xml;base64,AA,BB 1x, ../assets/images/same.gif 2x">',
+            '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
+            '<img src=../assets/images/same.gif alt=unquoted>',
+            '<img srcset=../assets/images/same.gif>',
+            '<p>notsame.gif is a different file name.</p>',
+        ]))
+        self.write(site, 'assets/css/site.css',
+                   '.a{background:url("../images/same.gif")} .b{background:url(/proj/previews/pr-7/assets/images/same.gif)}')
+        return root
+
+    def test_unchanged_media_is_dropped_and_every_reference_points_to_the_live_site(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            with contextlib.chdir(root):
+                reused, references, kept = reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj',
+                                                        reuser.base_blobs())
+            site = root / '_site'
+            self.assertEqual(set(reused), {'assets/images/same.gif'})
+            self.assertEqual(references, 14)
+            self.assertEqual(kept, [])
+            self.assertFalse((site / 'assets/images/same.gif').exists())
+            self.assertFalse((site / 'assets/images').exists(), 'empty directories are removed')
+            self.assertEqual((site / 'docs/images/changed.png').read_bytes(), self.NEW)
+            self.assertTrue((site / 'docs/images/new.gif').exists())
+            page = (site / 'docs/page.html').read_text().splitlines()
+            self.assertEqual(page, [
+                '<img src="/proj/assets/images/same.gif">',
+                '<img src="/proj/assets/images/same.gif">',
+                '<img src="/proj/assets/images/same.gif?v=1#top">',
+                '<a href="https://docs.example.test/proj/assets/images/same.gif">full size</a>',
+                '<img srcset="/proj/assets/images/same.gif 1x, images/new.gif 2x">',
+                '<img src="images/changed.png">',
+                '<img src="images/new.gif">',
+                '<img src="../../../etc/same.gif">',
+                '<img src="data:image/gif;base64,AAAA">',
+                '<a href="https://other.example/assets/images/same.gif">external</a>',
+                "<div style=\"background: url('/proj/assets/images/same.gif')\"></div>",
+                '<img src="/proj/assets/images/same.gif">',
+                # HTML escaping in the query is preserved, not decoded into a raw quote.
+                '<img src="/proj/assets/images/same.gif?a=1&amp;b=&quot;x">',
+                # Another host is external even when its path matches the preview base.
+                '<a href="https://other.example/proj/previews/pr-7/assets/images/same.gif">other host</a>',
+                # srcset follows HTML parsing: the comma inside the data URI is not a separator.
+                '<img srcset="data:image/svg+xml;base64,AA,BB 1x, /proj/assets/images/same.gif 2x">',
+                '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
+                # Unquoted attribute values are valid HTML and are rewritten too.
+                '<img src=/proj/assets/images/same.gif alt=unquoted>',
+                '<img srcset=/proj/assets/images/same.gif>',
+                '<p>notsame.gif is a different file name.</p>',
+            ])
+            self.assertEqual((site / 'index.html').read_text(),
+                             '<img src="/proj/assets/images/same.gif"><img src="docs/images/new.gif">')
+            self.assertEqual((site / 'assets/css/site.css').read_text(),
+                             '.a{background:url("/proj/assets/images/same.gif")} .b{background:url(/proj/assets/images/same.gif)}')
+
+    def test_media_named_outside_rewritable_references_is_kept(self):
+        cases = {
+            'script': ('assets/js/app.js', 'const shot = "assets/images/same.gif";'),
+            'entity-encoded query': ('docs/other.html', '<img src="../assets/images/same.gif&#63;x">'),
+        }
+        for name, (relative, content) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as temp:
+                root = self.repository(temp)
+                self.write(root / '_site', relative, content)
+                with contextlib.chdir(root):
+                    reused, references, kept = reuser.reuse(
+                        Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj', reuser.base_blobs())
+                self.assertEqual(reused, {})
+                self.assertEqual(kept, ['assets/images/same.gif'])
+                # The file stays, so both the rewritten live URLs and the unparsed mention still work.
+                self.assertEqual((root / '_site/assets/images/same.gif').read_bytes(), self.SAME)
+                self.assertEqual((root / '_site' / relative).read_text(), content)
+
+    def test_site_at_domain_root_uses_root_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            with contextlib.chdir(root):
+                reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test', reuser.base_blobs())
+            self.assertIn('<img src="/assets/images/same.gif">', (root / '_site/docs/page.html').read_text())
+
+    def test_main_reports_savings_in_the_step_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            summary = root / 'summary.md'
+            env = {'OUTPUT_DIR': '_site', 'SITE_URL': 'https://docs.example.test/proj',
+                   'PREVIEW_BASEURL': '/proj/previews/pr-7', 'GITHUB_STEP_SUMMARY': str(summary)}
+            with contextlib.chdir(root), patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+                reuser.main()
+            self.assertIn('Reused 1 unchanged media files', summary.read_text())
+
+    def test_missing_docs_branch_head_keeps_every_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp, with_parent=False)
+            env = {'OUTPUT_DIR': '_site', 'SITE_URL': 'https://docs.example.test/proj', 'PREVIEW_BASEURL': '/proj/previews/pr-7'}
+            output = io.StringIO()
+            with contextlib.chdir(root), patch.dict(os.environ, env), contextlib.redirect_stdout(output):
+                reuser.main()
+            self.assertIn('::warning::', output.getvalue())
+            self.assertTrue((root / '_site/assets/images/same.gif').exists())
+            self.assertIn('src="../assets/images/same.gif"', (root / '_site/docs/page.html').read_text())
+
+
 class WorkflowTests(unittest.TestCase):
+    def test_build_skips_fork_pull_requests_and_fetches_the_docs_branch_head(self):
+        job = BUILD['jobs']['build']
+        self.assertIn('github.event.pull_request.head.repo.full_name == github.repository', job['if'])
+        self.assertEqual(job['steps'][0]['with']['fetch-depth'], 2)
+        triggers = BUILD.get('on', BUILD.get(True))  # PyYAML reads the bare 'on' key as a boolean.
+        self.assertIs(triggers['workflow_call']['inputs']['reuse-live-media']['default'], True)
+
     def test_build_rejects_user_info_and_keeps_configurable_project_path(self):
         build = yaml.safe_load((ROOT / '.github/workflows/docs-preview-build.yml').read_text())
         code = next(s['run'] for s in build['jobs']['build']['steps'] if s.get('id') == 'configure')

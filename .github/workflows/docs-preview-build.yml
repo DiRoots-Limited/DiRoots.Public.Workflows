@@ -165,6 +165,7 @@ jobs:
               """Point references to reused media at the live site, leaving every other URL as written."""
 
               def __init__(self, preview_base, site_url, reused):
+                  """Take the preview base path, the live site URL and the set of reused site-relative paths."""
                   site = urlsplit(site_url)
                   self.preview = preview_base.rstrip('/') + '/'
                   self.live = site.path.rstrip('/')

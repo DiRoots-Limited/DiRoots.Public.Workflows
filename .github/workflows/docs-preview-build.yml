@@ -23,13 +23,22 @@ on:
       artifact-name:
         type: string
         default: docs-preview-site
+      reuse-live-media:
+        description: Drop media files the PR did not change and load them from the live site instead.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    # Fork PRs are never published, so skip their build instead of spending minutes
+    # on a preview the publisher would refuse. This is not a security boundary: the
+    # publisher independently rejects runs whose head repository is not the caller.
+    if: >-
+      github.event_name == 'pull_request' && github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     concurrency:
@@ -39,6 +48,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # The PR merge commit plus its first parent: the docs branch head GitHub merged into.
+          fetch-depth: 2
       - name: Configure preview build
         id: configure
         shell: python
@@ -94,6 +105,156 @@ jobs:
             bundle exec jekyll build --config "_config.yml,$override" --destination "$OUTPUT_DIR" --baseurl "$PREVIEW_BASEURL"
           fi
           test -f "$OUTPUT_DIR/index.html"
+      - name: Reuse unchanged media from the live site
+        id: reuse
+        if: inputs.reuse-live-media
+        shell: python
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          PREVIEW_BASEURL: ${{ steps.configure.outputs.baseurl }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+        run: |
+          # Docs sites are mostly images and GIFs, and a docs PR rarely changes them. Copying
+          # the whole built site into every preview makes large manuals exceed the Pages and
+          # artifact budgets. A media file whose bytes match the docs branch head is already
+          # served by the live site at the same path, so the preview drops its copy and its
+          # pages load that file from the live site. Pages, new media and changed media stay.
+          import hashlib
+          import html
+          import os
+          import posixpath
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import quote, unquote, urlsplit
+
+          MEDIA = {'.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.mov', '.mp4', '.png', '.svg', '.webm', '.webp'}
+          ATTRIBUTE = re.compile(r'''(\b(?:src|href|poster|data-src)\s*=\s*)(["'])(.*?)\2''', re.I | re.S)
+          SRCSET = re.compile(r'''(\bsrcset\s*=\s*)(["'])(.*?)\2''', re.I | re.S)
+          CSS_URL = re.compile(r'''(url\(\s*)(["']?)([^"')]*?)\2(\s*\))''', re.I)
+          SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
+
+          def base_blobs():
+              """Map each file path in the merge commit's first parent to its git blob id."""
+              listing = subprocess.run(['git', 'ls-tree', '-r', '-z', 'HEAD^1'], capture_output=True, check=True).stdout
+              blobs = {}
+              for record in listing.split(b'\0'):
+                  if record:
+                      meta, path = record.split(b'\t', 1)
+                      mode, kind, blob = meta.split(b' ')
+                      if kind == b'blob' and mode in (b'100644', b'100755'):
+                          blobs[path.decode('utf-8', 'surrogateescape')] = blob.decode()
+              return blobs
+
+          def blob_id(data):
+              return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
+
+          def unchanged_media(site, blobs):
+              found = {}
+              for path in site.rglob('*'):
+                  if path.suffix.lower() in MEDIA and path.is_file() and not path.is_symlink():
+                      relative = path.relative_to(site).as_posix()
+                      data = path.read_bytes()
+                      if blobs.get(relative) == blob_id(data):
+                          found[relative] = len(data)
+              return found
+
+          class Rewriter:
+              def __init__(self, preview_base, live_base, reused):
+                  self.preview = preview_base.rstrip('/') + '/'
+                  self.live = live_base.rstrip('/')
+                  self.reused = reused
+                  self.count = 0
+
+              def target(self, raw, page_dir):
+                  """Return the site-relative file a URL points to, plus its query and fragment."""
+                  value = html.unescape(raw).strip().replace('\\', '/')
+                  if not value or value.startswith(('#', '//')):
+                      return None
+                  parts = urlsplit(value)
+                  origin = ''
+                  if SCHEME.match(value):
+                      if parts.scheme.lower() not in ('http', 'https') or not parts.netloc:
+                          return None
+                      origin = f'{parts.scheme}://{parts.netloc}'
+                  path = parts.path
+                  if path.startswith('/'):
+                      if not path.startswith(self.preview):
+                          return None
+                      path = path[len(self.preview):]
+                  elif origin:
+                      return None
+                  else:
+                      path = posixpath.join(page_dir, path)
+                  path = posixpath.normpath(unquote(path)).strip()
+                  if path in ('.', '..') or path.startswith(('../', '/')):
+                      return None
+                  suffix = ('?' + parts.query if parts.query else '') + ('#' + parts.fragment if parts.fragment else '')
+                  return origin, path, suffix
+
+              def url(self, raw, page_dir):
+                  found = self.target(raw, page_dir)
+                  if not found or found[1] not in self.reused:
+                      return raw
+                  origin, path, suffix = found
+                  self.count += 1
+                  return f'{origin}{self.live}/{quote(path)}{suffix}'
+
+              def srcset(self, raw, page_dir):
+                  candidates = []
+                  for candidate in raw.split(','):
+                      pieces = candidate.strip().split(None, 1)
+                      if pieces:
+                          pieces[0] = self.url(pieces[0], page_dir)
+                          candidates.append(' '.join(pieces))
+                  return ', '.join(candidates)
+
+              def document(self, text, page_dir, markup):
+                  if markup:
+                      text = ATTRIBUTE.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2], text)
+                      text = SRCSET.sub(lambda m: m[1] + m[2] + self.srcset(m[3], page_dir) + m[2], text)
+                  return CSS_URL.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2] + m[4], text)
+
+          def reuse(site, preview_base, live_base, blobs):
+              reused = unchanged_media(site, blobs)
+              rewriter = Rewriter(preview_base, live_base, set(reused))
+              for path in site.rglob('*'):
+                  suffix = path.suffix.lower()
+                  if suffix in ('.html', '.htm', '.css') and path.is_file() and not path.is_symlink():
+                      relative = path.relative_to(site).as_posix()
+                      text = path.read_text(encoding='utf-8', errors='surrogateescape')
+                      updated = rewriter.document(text, posixpath.dirname(relative), suffix != '.css')
+                      if updated != text:
+                          path.write_text(updated, encoding='utf-8', errors='surrogateescape')
+              for relative in reused:
+                  (site / relative).unlink()
+              for directory in sorted((p for p in site.rglob('*') if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+                  if not any(directory.iterdir()):
+                      directory.rmdir()
+              return reused, rewriter.count
+
+          def main():
+              site = Path(os.environ['OUTPUT_DIR'])
+              live_base = urlsplit(os.environ['SITE_URL']).path
+              try:
+                  blobs = base_blobs()
+              except (OSError, subprocess.CalledProcessError):
+                  print('::warning::Docs branch head is unavailable; the preview keeps every media file.')
+                  return
+              total = sum(p.stat().st_size for p in site.rglob('*') if p.is_file())
+              reused, references = reuse(site, os.environ['PREVIEW_BASEURL'], live_base, blobs)
+              saved = sum(reused.values())
+              mib = 1024 * 1024
+              summary = (f'Reused {len(reused)} unchanged media files from the live site and rewrote '
+                         f'{references} references. Preview size {(total - saved) / mib:.1f} MiB '
+                         f'instead of {total / mib:.1f} MiB.')
+              print(summary)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+                      out.write(f'### Documentation preview build\n\n{summary}\n')
+
+          if __name__ == '__main__':
+              main()
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.artifact-name }}-${{ github.run_attempt }}

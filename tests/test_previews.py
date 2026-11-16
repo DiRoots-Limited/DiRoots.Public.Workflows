@@ -217,6 +217,11 @@ class MediaReuseTests(unittest.TestCase):
             '<a href="https://other.example/assets/images/same.gif">external</a>',
             "<div style=\"background: url('../assets/images/same.gif')\"></div>",
             '<img src="/proj/previews/pr-7/assets/images/same.gif%20">',
+            '<img src="../assets/images/same.gif?a=1&amp;b=&quot;x">',
+            '<a href="https://other.example/proj/previews/pr-7/assets/images/same.gif">other host</a>',
+            '<img srcset="data:image/svg+xml;base64,AA,BB 1x, ../assets/images/same.gif 2x">',
+            '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
+            '<img src="../assets/images/same.gif&#63;x">',
         ]))
         self.write(site, 'assets/css/site.css',
                    '.a{background:url("../images/same.gif")} .b{background:url(/proj/previews/pr-7/assets/images/same.gif)}')
@@ -226,10 +231,11 @@ class MediaReuseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = self.repository(temp)
             with contextlib.chdir(root):
-                reused, references = reuser.reuse(Path('_site'), '/proj/previews/pr-7', '/proj', reuser.base_blobs())
+                reused, references = reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj',
+                                                  reuser.base_blobs())
             site = root / '_site'
             self.assertEqual(set(reused), {'assets/images/same.gif'})
-            self.assertEqual(references, 10)
+            self.assertEqual(references, 12)
             self.assertFalse((site / 'assets/images/same.gif').exists())
             self.assertFalse((site / 'assets/images').exists(), 'empty directories are removed')
             self.assertEqual((site / 'docs/images/changed.png').read_bytes(), self.NEW)
@@ -248,6 +254,15 @@ class MediaReuseTests(unittest.TestCase):
                 '<a href="https://other.example/assets/images/same.gif">external</a>',
                 "<div style=\"background: url('/proj/assets/images/same.gif')\"></div>",
                 '<img src="/proj/assets/images/same.gif">',
+                # HTML escaping in the query is preserved, not decoded into a raw quote.
+                '<img src="/proj/assets/images/same.gif?a=1&amp;b=&quot;x">',
+                # Another host is external even when its path matches the preview base.
+                '<a href="https://other.example/proj/previews/pr-7/assets/images/same.gif">other host</a>',
+                # srcset follows HTML parsing: the comma inside the data URI is not a separator.
+                '<img srcset="data:image/svg+xml;base64,AA,BB 1x, /proj/assets/images/same.gif 2x">',
+                '<img srcset="data:image/svg+xml;base64,AA,BB  1x">',
+                # An entity-encoded query marker cannot be preserved exactly, so the URL is left alone.
+                '<img src="../assets/images/same.gif&#63;x">',
             ])
             self.assertEqual((site / 'index.html').read_text(),
                              '<img src="/proj/assets/images/same.gif"><img src="docs/images/new.gif">')
@@ -258,7 +273,7 @@ class MediaReuseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = self.repository(temp)
             with contextlib.chdir(root):
-                reuser.reuse(Path('_site'), '/proj/previews/pr-7', '', reuser.base_blobs())
+                reuser.reuse(Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test', reuser.base_blobs())
             self.assertIn('<img src="/assets/images/same.gif">', (root / '_site/docs/page.html').read_text())
 
     def test_main_reports_savings_in_the_step_summary(self):

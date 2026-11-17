@@ -97,7 +97,7 @@ The source-size budget is not a measurement of generated production output. Befo
 - Coordinate publication, close cleanup and sweeps with one mutation concurrency group per caller repository/Pages branch. `queue: max` retains pending operations and `cancel-in-progress: false` lets writes complete. Do not add a caller concurrency group that cancels the called job.
 - On push conflict, fetch the current branch and reapply only the intended directory change, rechecking PR state/head each time. Use at most five attempts; never force-push.
 - Post the preview comment only after the served marker identifies the expected PR, head, build run and attempt. Match the bot author as well as the configured comment marker.
-- On close, check the PR is still closed before deleting, wait for the marker to disappear and expire the comment. Reopened PRs are preserved. The sweep also repairs comments when an earlier deletion succeeded but comment update failed.
+- On close, check the PR is still closed before deleting, wait until Pages stops serving the marker and expire the comment. A 404 confirms removal at once; because some Pages sites answer missing paths with 503, the same error three times in a row also confirms it. Reopened PRs are preserved. The sweep also repairs comments when an earlier deletion succeeded but comment update failed.
 
 GitHub's PR API and git writes are not one atomic transaction. The publisher rechecks after deployment and repairs a PR that closed during publication; the scheduled sweep is the fallback if a job is interrupted. Run it manually after a failed close cleanup. Schedules may be delayed or disabled by GitHub after repository inactivity. A sweep across many previews may reach the job timeout; rerun it to continue.
 

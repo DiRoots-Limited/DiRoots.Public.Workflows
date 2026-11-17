@@ -396,5 +396,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(checkout['with']['persist-credentials'])
 
 
+class SiteWaitTests(unittest.TestCase):
+    """wait_for_site: removal accepts 404 or a persistent error; publication needs the exact identity."""
+
+    def run_wait(self, responses, expected, timeout=100):
+        calls = iter(responses)
+        clock = types.SimpleNamespace(value=0)
+
+        def urlopen(request, timeout):
+            reply = next(calls)
+            if isinstance(reply, int):
+                raise publisher.HTTPError(request.full_url, reply, 'status', {}, None)
+            return contextlib.nullcontext(io.BytesIO(reply))
+
+        def sleep(seconds):
+            clock.value += seconds
+
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock.value, sleep=sleep, time_ns=lambda: 1)
+        with patch.object(publisher, 'urlopen', urlopen), patch.object(publisher, 'time', fake_time):
+            publisher.wait_for_site('https://example.test/previews/pr-1/preview-info.json', expected, timeout)
+        return clock.value
+
+    def test_removal_is_confirmed_by_404_at_once(self):
+        self.assertEqual(self.run_wait([b'{"pull_request": 1}', 404], None), 10)
+
+    def test_removal_is_confirmed_by_persistent_503(self):
+        # Some Pages sites serve missing paths with 503; three in a row confirm the preview is gone.
+        self.assertEqual(self.run_wait([503, 503, 503], None), 20)
+
+    def test_changing_error_statuses_restart_the_count(self):
+        # 503, 502, 500 never repeat, so nothing persisted; three 500s in a row then confirm removal.
+        self.assertEqual(self.run_wait([503, 502, 500, 500, 500], None), 40)
+        with self.assertRaises(RuntimeError):
+            self.run_wait([503, 502, 500, 503, 502, 500, 503, 502, 500, 503], None)
+
+    def test_transient_error_between_served_responses_does_not_confirm_removal(self):
+        with self.assertRaises(RuntimeError):
+            self.run_wait([503, 503, b'{}', 503, 503, b'{}', 503, 503, b'{}', 503, 503], None)
+
+    def test_publication_never_accepts_an_error(self):
+        identity = {'pull_request': 1, 'head_sha': 'a' * 40}
+        with self.assertRaises(RuntimeError):
+            self.run_wait([503] * 11, identity)
+        self.assertEqual(self.run_wait([503, 404, json.dumps(identity).encode()], identity), 20)
+
+
 if __name__ == '__main__':
     unittest.main()

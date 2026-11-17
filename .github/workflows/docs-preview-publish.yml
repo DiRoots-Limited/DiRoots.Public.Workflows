@@ -297,17 +297,29 @@ jobs:
                   time.sleep(2 ** attempt)
               raise RuntimeError('Could not push preview change after five attempts')
 
-          def wait_for_site(url, expected, timeout):
+          def wait_for_site(url, expected, timeout, confirm=3):
+              """Wait until Pages serves `expected` (a preview identity), or stops serving the preview (None).
+
+              Removal is confirmed by a 404 or 410, or by the same other HTTP status `confirm` times in a
+              row: some Pages sites answer missing paths with 503 instead of 404. A served response or a
+              different status restarts the count. The preview is already deleted from the branch at this
+              point, so a status that persists means it is no longer served.
+              """
               deadline = time.monotonic() + timeout
+              errors, last = 0, None
               while time.monotonic() < deadline:
                   try:
                       with urlopen(Request(url + '?check=' + str(time.time_ns()), headers={'Cache-Control': 'no-cache'}), timeout=15) as response:
                           body = response.read(65536)
+                      errors, last = 0, None
                       if expected is not None and json.loads(body) == expected:
                           return
                   except HTTPError as error:
-                      if expected is None and error.code == 404:
-                          return
+                      if expected is None:
+                          errors = errors + 1 if error.code == last else 1
+                          last = error.code
+                          if error.code in (404, 410) or errors >= confirm:
+                              return
                   except (URLError, TimeoutError, ValueError):
                       pass
                   time.sleep(10)

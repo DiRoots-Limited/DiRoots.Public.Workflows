@@ -424,6 +424,12 @@ class SiteWaitTests(unittest.TestCase):
         # Some Pages sites serve missing paths with 503; three in a row confirm the preview is gone.
         self.assertEqual(self.run_wait([503, 503, 503], None), 20)
 
+    def test_changing_error_statuses_restart_the_count(self):
+        # 503, 502, 500 never repeat, so nothing persisted; three 500s in a row then confirm removal.
+        self.assertEqual(self.run_wait([503, 502, 500, 500, 500], None), 40)
+        with self.assertRaises(RuntimeError):
+            self.run_wait([503, 502, 500, 503, 502, 500, 503, 502, 500, 503], None)
+
     def test_transient_error_between_served_responses_does_not_confirm_removal(self):
         with self.assertRaises(RuntimeError):
             self.run_wait([503, 503, b'{}', 503, 503, b'{}', 503, 503, b'{}', 503, 503], None)

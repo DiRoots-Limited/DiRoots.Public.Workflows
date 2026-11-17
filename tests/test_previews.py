@@ -292,6 +292,31 @@ class MediaReuseTests(unittest.TestCase):
                 self.assertEqual((root / '_site/assets/images/same.gif').read_bytes(), self.SAME)
                 self.assertEqual((root / '_site' / relative).read_text(), content)
 
+    def test_commented_out_images_do_not_keep_media(self):
+        # Docs keep placeholder images commented out; browsers never load them, so they must not block reuse.
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            comment = '<p>Text</p>\n<!-- ![Hidden](../assets/images/same.gif) <sub>Not recorded yet</sub> -->'
+            self.write(root / '_site', 'docs/hidden.html', comment)
+            with contextlib.chdir(root):
+                reused, references, kept = reuser.reuse(
+                    Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj', reuser.base_blobs())
+            self.assertEqual(set(reused), {'assets/images/same.gif'})
+            self.assertEqual(kept, [])
+            self.assertEqual((root / '_site/docs/hidden.html').read_text(), comment, 'comments are left as written')
+
+    def test_commented_img_does_not_hide_a_real_mention(self):
+        # A commented <img> is neither rewritten nor counted, so a script mention still keeps the file.
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            self.write(root / '_site', 'docs/hidden.html', '<!-- <img src="../assets/images/same.gif"> -->')
+            self.write(root / '_site', 'assets/js/app.js', 'const shot = "assets/images/same.gif";')
+            with contextlib.chdir(root):
+                reused, references, kept = reuser.reuse(
+                    Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj', reuser.base_blobs())
+            self.assertEqual(kept, ['assets/images/same.gif'])
+            self.assertIn('<!-- <img src="../assets/images/same.gif"> -->', (root / '_site/docs/hidden.html').read_text())
+
     def test_site_at_domain_root_uses_root_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.repository(temp)

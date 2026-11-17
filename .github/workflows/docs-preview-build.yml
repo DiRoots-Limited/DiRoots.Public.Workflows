@@ -137,6 +137,9 @@ jobs:
           SCANNED = {'.css', '.htm', '.html', '.js', '.json', '.mjs', '.svg', '.webmanifest', '.xml'}
           CSS_URL = re.compile(r'''(url\(\s*)(["']?)([^"')]*?)\2(\s*\))''', re.I)
           SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
+          # Browsers never load anything inside HTML comments, so comments are neither rewritten nor
+          # counted as mentions (docs often keep placeholder images commented out).
+          COMMENT = re.compile(r'(<!--.*?-->)', re.S)
 
           def base_blobs():
               """Map each file path in the merge commit's first parent to its git blob id."""
@@ -270,10 +273,15 @@ jobs:
                       if match[2]:
                           return match[1] + match[2] + rewrite(match[3], page_dir) + match[2]
                       return match[1] + rewrite(match[4], page_dir)
-                  if markup:
-                      text = ATTRIBUTE.sub(lambda m: attribute(m, self.url), text)
-                      text = SRCSET.sub(lambda m: attribute(m, self.srcset), text)
-                  return CSS_URL.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2] + m[4], text)
+                  def rewrite(part):
+                      if markup:
+                          part = ATTRIBUTE.sub(lambda m: attribute(m, self.url), part)
+                          part = SRCSET.sub(lambda m: attribute(m, self.srcset), part)
+                      return CSS_URL.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2] + m[4], part)
+                  if not markup:
+                      return rewrite(text)
+                  # Odd parts of the split are comments: keep them exactly as written.
+                  return ''.join(part if i % 2 else rewrite(part) for i, part in enumerate(COMMENT.split(text)))
 
           def mentions(texts, names):
               """Count whole-name occurrences of each file name (plain or percent-encoded) across texts."""
@@ -310,7 +318,7 @@ jobs:
                           if updated != text:
                               path.write_text(updated, encoding='utf-8', errors='surrogateescape')
                           text = updated
-                      texts.append(text)
+                      texts.append(COMMENT.sub('', text) if suffix in ('.html', '.htm') else text)
               seen = mentions(texts, rewriter.names)
               unsafe = {name for name in rewriter.names if seen[name] > rewriter.accounted[name]}
               kept = sorted(path for path in candidates if posixpath.basename(path) in unsafe)

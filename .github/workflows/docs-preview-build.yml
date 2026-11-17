@@ -138,8 +138,19 @@ jobs:
           CSS_URL = re.compile(r'''(url\(\s*)(["']?)([^"')]*?)\2(\s*\))''', re.I)
           SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
           # Browsers never load anything inside HTML comments, so comments are neither rewritten nor
-          # counted as mentions (docs often keep placeholder images commented out).
-          COMMENT = re.compile(r'(<!--.*?-->)', re.S)
+          # counted as mentions (docs often keep placeholder images commented out). Raw-text elements
+          # are matched first: '<!--' inside a script, style or textarea is text, not a comment.
+          HTML_PARTS = re.compile(r'(<(script|style|textarea)\b[^>]*>.*?</\2\s*>)|(<!--.*?-->)', re.I | re.S)
+
+          def html_parts(text):
+              """Split HTML into (is_comment, text) parts, treating raw-text elements as ordinary text."""
+              parts, position = [], 0
+              for match in HTML_PARTS.finditer(text):
+                  if match[3]:
+                      parts += [(False, text[position:match.start()]), (True, match[3])]
+                      position = match.end()
+              parts.append((False, text[position:]))
+              return parts
 
           def base_blobs():
               """Map each file path in the merge commit's first parent to its git blob id."""
@@ -280,8 +291,8 @@ jobs:
                       return CSS_URL.sub(lambda m: m[1] + m[2] + self.url(m[3], page_dir) + m[2] + m[4], part)
                   if not markup:
                       return rewrite(text)
-                  # Odd parts of the split are comments: keep them exactly as written.
-                  return ''.join(part if i % 2 else rewrite(part) for i, part in enumerate(COMMENT.split(text)))
+                  # Comments are kept exactly as written; everything else is rewritten.
+                  return ''.join(part if comment else rewrite(part) for comment, part in html_parts(text))
 
           def mentions(texts, names):
               """Count whole-name occurrences of each file name (plain or percent-encoded) across texts."""
@@ -318,7 +329,9 @@ jobs:
                           if updated != text:
                               path.write_text(updated, encoding='utf-8', errors='surrogateescape')
                           text = updated
-                      texts.append(COMMENT.sub('', text) if suffix in ('.html', '.htm') else text)
+                      if suffix in ('.html', '.htm'):
+                          text = ''.join(part for comment, part in html_parts(text) if not comment)
+                      texts.append(text)
               seen = mentions(texts, rewriter.names)
               unsafe = {name for name in rewriter.names if seen[name] > rewriter.accounted[name]}
               kept = sorted(path for path in candidates if posixpath.basename(path) in unsafe)

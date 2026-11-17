@@ -317,6 +317,18 @@ class MediaReuseTests(unittest.TestCase):
             self.assertEqual(kept, ['assets/images/same.gif'])
             self.assertIn('<!-- <img src="../assets/images/same.gif"> -->', (root / '_site/docs/hidden.html').read_text())
 
+    def test_comment_marker_inside_script_is_not_a_comment(self):
+        # '<!--' inside a script is text: the mention after it still counts, so the image is kept.
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.repository(temp)
+            script = '<script>const a = "<!--"; const shot = "assets/images/same.gif"; const b = "-->";</script>'
+            self.write(root / '_site', 'docs/scripted.html', script)
+            with contextlib.chdir(root):
+                reused, references, kept = reuser.reuse(
+                    Path('_site'), '/proj/previews/pr-7', 'https://docs.example.test/proj', reuser.base_blobs())
+            self.assertEqual(kept, ['assets/images/same.gif'])
+            self.assertTrue((root / '_site/assets/images/same.gif').exists())
+
     def test_site_at_domain_root_uses_root_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.repository(temp)

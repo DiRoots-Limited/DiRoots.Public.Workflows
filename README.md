@@ -3,7 +3,7 @@ Shared GitHub Actions workflows for DiRoots public repositories, including docum
 
 ## Documentation PR previews
 
-These reusable workflows generalize DiStem's documentation preview flow. A caller repository builds a documentation PR without publishing credentials, uploads static files, and lets a trusted workflow publish them under its own Pages site. Closing the PR removes that preview. Daily and manual reconciliation repair missed cleanup.
+These reusable workflows generalize DiStem's documentation preview flow. A caller repository builds a documentation PR without publishing credentials, uploads static files, and lets a trusted workflow publish them under its own Pages site. Closing the PR removes that preview. A monthly scheduled sweep and manual runs repair missed cleanup.
 
 Start with the sandbox repository. This implementation is ready for review and automated checks; the GitHub App publishing lifecycle must be validated there before onboarding production documentation.
 
@@ -99,7 +99,7 @@ The source-size budget is not a measurement of generated production output. Befo
 - Post the preview comment only after the served marker identifies the expected PR, head, build run and attempt. Match the bot author as well as the configured comment marker.
 - On close, check the PR is still closed before deleting, wait until Pages stops serving the marker and expire the comment. A 404 confirms removal at once; because some Pages sites answer missing paths with 503, the same error three times in a row also confirms it. Reopened PRs are preserved. The sweep also repairs comments when an earlier deletion succeeded but comment update failed.
 
-GitHub's PR API and git writes are not one atomic transaction. The publisher rechecks after deployment and repairs a PR that closed during publication; the scheduled sweep is the fallback if a job is interrupted. Run it manually after a failed close cleanup. Schedules may be delayed or disabled by GitHub after repository inactivity. A sweep across many previews may reach the job timeout; rerun it to continue.
+GitHub's PR API and git writes are not one atomic transaction. The publisher rechecks after deployment and repairs a PR that closed during publication; the scheduled sweep is the fallback if a job is interrupted. The example schedules it monthly: close-triggered cleanup handles the normal case, so the sweep only catches rare misses, and a monthly schedule keeps runs and failure notifications low. It only removes previews of closed PRs; open PRs are never touched. Run it manually after a failed close cleanup. Schedules may be delayed or disabled by GitHub after repository inactivity. A sweep across many previews may reach the job timeout; rerun it to continue.
 
 The shared App key remains a trust boundary: repository writers who can access it can request other tokens within that App installation. Restrict both App installation and organization-secret access. Separate keys for the same App do not isolate repositories. Private-repository previews on a public Pages site publish draft content publicly and require an explicit visibility decision.
 

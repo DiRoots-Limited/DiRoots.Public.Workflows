@@ -8,7 +8,8 @@ on:
     branches: [gh-pages]
     types: [closed]
   schedule:
-    - cron: '17 3 * * *'
+    # Monthly sweep: closing a PR removes its preview at once; this only catches a missed cleanup.
+    - cron: '17 3 1 * *'
   workflow_dispatch:
 
 permissions:
